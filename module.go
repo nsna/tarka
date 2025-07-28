@@ -27,7 +27,7 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 	p.Username = caddy.NewReplacer().ReplaceAll(p.Username, "")
 	p.Password = caddy.NewReplacer().ReplaceAll(p.Password, "")
 	p.DomainID = caddy.NewReplacer().ReplaceAll(p.DomainID, "")
-
+	p.log = caddy.Log().Named("dns.providers.tarka")
 	return nil
 }
 

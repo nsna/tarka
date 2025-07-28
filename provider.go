@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/libdns/libdns"
+	"go.uber.org/zap"
 )
 
 // Provider implements the libdns interfaces for Tarka DNS
@@ -31,6 +31,9 @@ type Provider struct {
 
 	// httpClient for making requests
 	httpClient *http.Client
+
+	// logging module via Caddy
+	log *zap.Logger
 }
 
 // GetRecords lists DNS records in the zone. This is a no-op for our use case.
@@ -102,7 +105,7 @@ func (p *Provider) ensureAuthenticated(ctx context.Context) error {
 	if p.httpClient != nil && p.isSessionValid(ctx) {
 		return nil
 	}
-	log.Printf("[TARKA] Session is invalid or uninitialized, authenticating...")
+	p.log.Info("session is invalid or uninitialized, authenticating")
 	return p.login(ctx)
 }
 
@@ -119,7 +122,7 @@ func (p *Provider) isSessionValid(ctx context.Context) bool {
 
 	u, err := url.Parse(baseURL)
 	if err != nil {
-		log.Printf("[TARKA] Failed to parse BaseURL for session validation: %v", err)
+		p.log.Error("failed to parse BaseURL for session validation", zap.String("base_url", baseURL), zap.Error(err))
 		return false
 	}
 	if len(p.httpClient.Jar.Cookies(u)) == 0 {
@@ -130,7 +133,7 @@ func (p *Provider) isSessionValid(ctx context.Context) bool {
 	req, err := http.NewRequestWithContext(ctx, "GET", baseURL+"/customer-view.php", nil)
 	if err != nil {
 		// If we can't create the request, assume session is invalid
-		log.Printf("[TARKA] Failed to create session validation request: %v", err)
+		p.log.Error("failed to create session validation request", zap.Error(err))
 		return false
 	}
 
@@ -148,20 +151,20 @@ func (p *Provider) isSessionValid(ctx context.Context) bool {
 	resp, err := client.Do(req)
 	if err != nil {
 		// Network error or timeout, assume session is invalid
-		log.Printf("[TARKA] Session validation request failed: %v", err)
+		p.log.Error("session validation request failed", zap.Error(err))
 		return false
 	}
 	defer resp.Body.Close()
 
 	// Check if we got a successful response
 	if resp.StatusCode == http.StatusOK {
-		log.Printf("[TARKA] Session validation successful")
+		p.log.Info("session validation successful")
 		return true
 	}
 
 	// If we got a redirect (3xx) or any other non-200 status,
 	// the session is likely invalid
-	log.Printf("[TARKA] Session validation failed with status: %d", resp.StatusCode)
+	p.log.Warn("session validation failed", zap.Int("status_code", resp.StatusCode))
 	return false
 }
 
@@ -215,7 +218,7 @@ func (p *Provider) login(ctx context.Context) error {
 	}
 	for _, cookie := range p.httpClient.Jar.Cookies(u) {
 		if cookie.Name == "tarka_netcraft_com_au-auth-cookie-2" {
-			log.Printf("[TARKA] Successfully authenticated and obtained session cookie")
+			p.log.Info("successfully authenticated and obtained session cookie")
 			return nil
 		}
 	}
