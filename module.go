@@ -24,24 +24,40 @@ func (Provider) CaddyModule() caddy.ModuleInfo {
 // Before using the provider config, resolve placeholders in the API token(s).
 // Implements caddy.Provisioner.
 func (p *Provider) Provision(ctx caddy.Context) error {
-	p.APIToken = caddy.NewReplacer().ReplaceAll(p.APIToken, "")
+	p.Username = caddy.NewReplacer().ReplaceAll(p.Username, "")
+	p.Password = caddy.NewReplacer().ReplaceAll(p.Password, "")
+	p.DomainID = caddy.NewReplacer().ReplaceAll(p.DomainID, "")
 
 	return nil
 }
 
 // Expansion of placeholders in the API token is left to the JSON config caddy.Provisioner (above).
 func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	d.Next() // consume directive name
-
-	if d.NextArg() {
-		p.APIToken = d.Val()
-	} else {
+	for d.Next() {
+		if d.NextArg() {
+			return d.ArgErr()
+		}
 		for nesting := d.Nesting(); d.NextBlock(nesting); {
 			switch d.Val() {
-			case "api_token":
+			case "username":
 				if d.NextArg() {
-					p.APIToken = d.Val()
-				} else {
+					p.Username = d.Val()
+				}
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+			case "password":
+				if d.NextArg() {
+					p.Password = d.Val()
+				}
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+			case "domain_id":
+				if d.NextArg() {
+					p.DomainID = d.Val()
+				}
+				if d.NextArg() {
 					return d.ArgErr()
 				}
 			default:
@@ -49,11 +65,14 @@ func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 		}
 	}
-	if d.NextArg() {
-		return d.Errf("unexpected argument '%s'", d.Val())
+	if p.Username == "" {
+		return d.Err("missing 'username'")
 	}
-	if p.APIToken == "" {
-		return d.Err("missing API token")
+	if p.Password == "" {
+		return d.Err("missing 'password'")
+	}
+	if p.DomainID == "" {
+		return d.Err("missing 'domain_id'")
 	}
 	return nil
 }
