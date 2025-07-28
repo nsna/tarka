@@ -267,6 +267,8 @@ func (p *Provider) addTXTRecord(ctx context.Context, name, data string, ttl time
 	recordData.Set("caa_value", "")
 	recordData.Set("expires", "10 minutes") // Auto-expire for ACME challenges
 
+	p.log.Info("Adding TXT record", zap.Any("record", recordData))
+
 	// Create the request
 	requestURL := fmt.Sprintf("%s/domain-rr-edit.php?domain_id=%s&do_add=1", baseURL, domainID)
 	req, err := http.NewRequestWithContext(ctx, "POST", requestURL, strings.NewReader(recordData.Encode()))
