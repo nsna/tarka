@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/libdns/libdns"
 	"go.uber.org/zap"
@@ -22,6 +23,9 @@ type Provider struct {
 
 	// BaseURL is the base URL for Tarka DNS (defaults to https://tarka.cloud/custdata)
 	BaseURL string `json:"base_url,omitempty"`
+
+	// Delay to wait for DNS records to apply
+	PropogationWaitTime time.Duration `json:"propogation_wait_time,omitempty"`
 
 	// httpClient for making requests
 	httpClient *http.Client
@@ -61,6 +65,8 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		}
 
 		appendedRecords = append(appendedRecords, record)
+		// It seems that the HTTP endpoint has a short delay before DNS records are actually active.
+		//
 	}
 
 	return appendedRecords, nil

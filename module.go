@@ -1,6 +1,8 @@
 package tarka
 
 import (
+	"time"
+
 	caddy "github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
@@ -27,6 +29,11 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 	p.Username = caddy.NewReplacer().ReplaceAll(p.Username, "")
 	p.Password = caddy.NewReplacer().ReplaceAll(p.Password, "")
 	p.DomainID = caddy.NewReplacer().ReplaceAll(p.DomainID, "")
+
+	// Set the default propagation wait time if it hasn't been set in the Caddyfile.
+	if p.PropogationWaitTime == 0 {
+		p.PropogationWaitTime = 5 * time.Second
+	}
 	p.log = caddy.Log().Named("dns.providers.tarka")
 	return nil
 }
@@ -56,6 +63,17 @@ func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			case "domain_id":
 				if d.NextArg() {
 					p.DomainID = d.Val()
+				}
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+			case "propagation_wait_time":
+				if d.NextArg() {
+					duration, err := caddy.ParseDuration(d.Val())
+					if err != nil {
+						return d.Errf("invalid duration for propagation_wait_time: %v", err)
+					}
+					p.PropogationWaitTime = duration
 				}
 				if d.NextArg() {
 					return d.ArgErr()
