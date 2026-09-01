@@ -15,6 +15,12 @@ import (
 	"go.uber.org/zap"
 )
 
+// domainListingHTML mimics the record table Tarka renders, <wbr> tags and all.
+const domainListingHTML = `<table>
+<tr><td>www</td><td>A</td><td>10.0.0.1</td><td><a href="domain-rr-edit.php?domain_rr_id=1">edit</a></td></tr>
+<tr><td>_acme-chall<wbr>enge</td><td>TXT</td><td>test-<wbr>token</td><td><a href="domain-rr-edit.php?domain_rr_id=4242">edit</a></td></tr>
+</table>`
+
 // mockServer creates a httptest.Server to mock the Tarka API.
 func mockServer() *httptest.Server {
 	mux := http.NewServeMux()
@@ -51,7 +57,18 @@ func mockServer() *httptest.Server {
 		fmt.Fprintln(w, "Customer view page")
 	})
 
-	// Mock record creation
+	// Mock domain listing used to resolve a record's ID before deletion
+	mux.HandleFunc("/custdata/domain-view.php", func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie("tarka_netcraft_com_au-auth-cookie-2")
+		if err != nil || cookie.Value != "test-session-cookie" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, domainListingHTML)
+	})
+
+	// Mock record creation and deletion
 	mux.HandleFunc("/custdata/domain-rr-edit.php", func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("tarka_netcraft_com_au-auth-cookie-2")
 		if err != nil || cookie.Value != "test-session-cookie" {
@@ -59,12 +76,21 @@ func mockServer() *httptest.Server {
 			return
 		}
 
-		if r.FormValue("do_add") == "1" && r.FormValue("rr_type_id") == "8" {
+		switch {
+		case r.FormValue("do_add") == "1" && r.FormValue("data") == "bad-token":
+			// Tarka answers 200 with the error embedded in the page
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, `<i id="error_elem">something went wrong</i>`)
+		case r.FormValue("do_add") == "1" && r.FormValue("rr_type_id") == "8":
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintln(w, "Record added")
-		} else {
-			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprintln(w, "Bad request")
+		case r.FormValue("do_delete") == "on" && r.FormValue("domain_rr_id") == "4242":
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, "Record deleted")
+		default:
+			// Tarka answers 200 with the error embedded in the page
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, `<i id="error_elem">something went wrong</i>`)
 		}
 	})
 
@@ -89,10 +115,10 @@ func TestProvider_AppendRecords_Success(t *testing.T) {
 
 	records := []libdns.Record{
 		libdns.RR{
-			Type:  "TXT",
-			Name:  "_acme-challenge",
-			Data:  "test-token",
-			TTL:   120 * time.Second,
+			Type: "TXT",
+			Name: "_acme-challenge",
+			Data: "test-token",
+			TTL:  120 * time.Second,
 		},
 	}
 
@@ -167,4 +193,83 @@ func TestProvider_isSessionValid(t *testing.T) {
 			t.Error("expected session to be invalid when no client exists, but it was valid")
 		}
 	})
+}
+func TestExtractRecordID(t *testing.T) {
+	id, err := extractRecordID(domainListingHTML, "_acme-challenge", "test-token")
+	if err != nil {
+		t.Fatalf("extractRecordID failed: %v", err)
+	}
+	if id != "4242" {
+		t.Errorf("expected record id '4242', got '%s'", id)
+	}
+
+	if _, err := extractRecordID(domainListingHTML, "_acme-challenge", "other-token"); err == nil {
+		t.Error("expected an error for a value that is not in the listing")
+	}
+}
+
+func TestExtractError(t *testing.T) {
+	err := extractError(`<i id="error_elem">name already in use</i>`)
+	if !strings.Contains(err.Error(), "name already in use") {
+		t.Errorf("expected the embedded message, got: %v", err)
+	}
+}
+
+func TestProvider_DeleteRecords_Success(t *testing.T) {
+	server := mockServer()
+	defer server.Close()
+
+	p := newTestProvider(server.URL)
+
+	records := []libdns.Record{
+		libdns.RR{Type: "TXT", Name: "_acme-challenge", Data: "test-token"},
+	}
+
+	deleted, err := p.DeleteRecords(context.Background(), "example.com", records)
+	if err != nil {
+		t.Fatalf("DeleteRecords failed: %v", err)
+	}
+	if len(deleted) != 1 {
+		t.Fatalf("expected 1 record to be deleted, got %d", len(deleted))
+	}
+}
+
+// A record that already auto-expired is not an error: cleanup has nothing to do.
+func TestProvider_DeleteRecords_AlreadyGone(t *testing.T) {
+	server := mockServer()
+	defer server.Close()
+
+	p := newTestProvider(server.URL)
+
+	records := []libdns.Record{
+		libdns.RR{Type: "TXT", Name: "_acme-challenge", Data: "expired-token"},
+	}
+
+	deleted, err := p.DeleteRecords(context.Background(), "example.com", records)
+	if err != nil {
+		t.Fatalf("expected missing record to be treated as deleted, got: %v", err)
+	}
+	if len(deleted) != 1 {
+		t.Fatalf("expected 1 record reported deleted, got %d", len(deleted))
+	}
+}
+
+// Tarka returns 200 with the failure embedded in the HTML, so the body must be checked.
+func TestProvider_AppendRecords_EmbeddedError(t *testing.T) {
+	server := mockServer()
+	defer server.Close()
+
+	p := newTestProvider(server.URL)
+
+	records := []libdns.Record{
+		libdns.RR{Type: "TXT", Name: "_acme-challenge", Data: "bad-token"},
+	}
+
+	_, err := p.AppendRecords(context.Background(), "example.com", records)
+	if err == nil {
+		t.Fatal("expected the embedded error to surface, but the append succeeded")
+	}
+	if !strings.Contains(err.Error(), "something went wrong") {
+		t.Errorf("expected the embedded message, got: %v", err)
+	}
 }

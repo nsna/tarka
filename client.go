@@ -7,22 +7,65 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/libdns/libdns"
 	"go.uber.org/zap"
 )
 
-// createRecord is a helper function to create a libdns.Record from an RR
-func createRecord(name, recordType, data string, ttl time.Duration) libdns.Record {
-	return libdns.RR{
-		Name: name,
-		Type: recordType,
-		Data: data,
-		TTL:  ttl,
+var (
+	errorElemRegex = regexp.MustCompile(`(?i)<i\s+id=['"]error_elem['"][^>]*>(.*?)</i>`)
+	recordIDRegex  = regexp.MustCompile(`domain_rr_id=(\d+)`)
+)
+
+// baseURL returns the configured base URL or the Tarka default.
+func (p *Provider) baseURL() string {
+	if p.BaseURL == "" {
+		return "https://tarka.cloud/custdata"
 	}
+	return p.BaseURL
+}
+
+// domainID returns the configured domain ID or the default zone.
+func (p *Provider) domainID() string {
+	if p.DomainID == "" {
+		return "77"
+	}
+	return p.DomainID
+}
+
+// extractError pulls the Tarka error element out of an HTML body. The PHP app
+// answers 200 OK with the failure embedded in the page, so status alone lies.
+func extractError(body string) error {
+	if m := errorElemRegex.FindStringSubmatch(body); len(m) > 1 {
+		return fmt.Errorf("tarka rejected request: %s", strings.TrimSpace(strings.ReplaceAll(m[1], "\n", " ")))
+	}
+	return fmt.Errorf("unknown error occurred, body snippet: %s", truncate(body, 200))
+}
+
+// extractRecordID finds the row for a record in the domain listing and returns its ID.
+func extractRecordID(body, name, data string) (string, error) {
+	// <wbr> tags are sprinkled through long values; strip them so the text is contiguous.
+	clean := strings.ReplaceAll(body, "<wbr>", "")
+	clean = strings.ReplaceAll(clean, "<WBR>", "")
+
+	for row := range strings.SplitSeq(clean, "</tr>") {
+		if strings.Contains(row, name) && strings.Contains(row, "TXT") && strings.Contains(row, data) {
+			if m := recordIDRegex.FindStringSubmatch(row); len(m) > 1 {
+				return m[1], nil
+			}
+		}
+	}
+	return "", fmt.Errorf("record not found in domain listing")
+}
+
+func truncate(s string, n int) string {
+	if len(s) < n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // ensureAuthenticated makes sure we have a valid session
@@ -40,10 +83,7 @@ func (p *Provider) isSessionValid(ctx context.Context) bool {
 		return false
 	}
 
-	baseURL := p.BaseURL
-	if baseURL == "" {
-		baseURL = "https://tarka.cloud/custdata"
-	}
+	baseURL := p.baseURL()
 
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -106,10 +146,7 @@ func (p *Provider) login(ctx context.Context) error {
 		}
 	}
 
-	baseURL := p.BaseURL
-	if baseURL == "" {
-		baseURL = "https://tarka.cloud/custdata"
-	}
+	baseURL := p.baseURL()
 
 	// Prepare login data
 	loginData := url.Values{}
@@ -132,6 +169,11 @@ func (p *Provider) login(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "error_elem") {
+		return fmt.Errorf("login failed: %v", extractError(string(body)))
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("login failed with status: %d", resp.StatusCode)
 	}
@@ -153,15 +195,8 @@ func (p *Provider) login(ctx context.Context) error {
 
 // addTXTRecord adds a TXT record using the Tarka DNS API
 func (p *Provider) addTXTRecord(ctx context.Context, name, data string, ttl time.Duration) error {
-	baseURL := p.BaseURL
-	if baseURL == "" {
-		baseURL = "https://tarka.cloud/custdata"
-	}
-
-	domainID := p.DomainID
-	if domainID == "" {
-		domainID = "77" // Default domain ID
-	}
+	baseURL := p.baseURL()
+	domainID := p.domainID()
 
 	// The name comes from libdns as a relative name (e.g., "_acme-challenge.app.tic")
 	// We need to process it for Tarka's API which expects the name without the zone suffix
@@ -210,11 +245,81 @@ func (p *Provider) addTXTRecord(ctx context.Context, name, data string, ttl time
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		// Read response body for debugging
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("record creation failed with status %d: %s", resp.StatusCode, string(body))
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "error_elem") {
+		return fmt.Errorf("adding record failed: %v", extractError(string(body)))
 	}
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("record creation failed with status %d: %s", resp.StatusCode, truncate(string(body), 200))
+	}
+
+	return nil
+}
+
+// deleteTXTRecord looks the record up in the domain listing and deletes it by ID.
+// A record that is already gone (auto-expired) is treated as success.
+func (p *Provider) deleteTXTRecord(ctx context.Context, name, data string) error {
+	baseURL := p.baseURL()
+	domainID := p.domainID()
+
+	if name == "@" {
+		name = ""
+	}
+
+	listURL := fmt.Sprintf("%s/domain-view.php?domain_id=%s", baseURL, domainID)
+	req, err := http.NewRequestWithContext(ctx, "GET", listURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create list request: %w", err)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch domain list: %w", err)
+	}
+	defer resp.Body.Close()
+
+	listBody, _ := io.ReadAll(resp.Body)
+
+	recordID, err := extractRecordID(string(listBody), name, data)
+	if err != nil {
+		p.log.Info("record not present in listing, assuming already expired",
+			zap.String("name", name))
+		return nil
+	}
+
+	deleteData := url.Values{}
+	deleteData.Set("domain_rr_id", recordID)
+	deleteData.Set("do_change", "1")
+	deleteData.Set("do_delete", "on")
+	deleteData.Set("name", name)
+	deleteData.Set("rr_type_id", "8") // TXT record type
+	deleteData.Set("data", data)
+
+	deleteURL := fmt.Sprintf("%s/domain-rr-edit.php?domain_rr_id=%s", baseURL, recordID)
+	delReq, err := http.NewRequestWithContext(ctx, "POST", deleteURL, strings.NewReader(deleteData.Encode()))
+	if err != nil {
+		return fmt.Errorf("failed to create delete request: %w", err)
+	}
+
+	delReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	delReq.Header.Set("Referer", deleteURL)
+
+	delResp, err := p.httpClient.Do(delReq)
+	if err != nil {
+		return fmt.Errorf("delete request failed: %w", err)
+	}
+	defer delResp.Body.Close()
+
+	delBody, _ := io.ReadAll(delResp.Body)
+	if strings.Contains(string(delBody), "error_elem") {
+		return fmt.Errorf("delete failed: %v", extractError(string(delBody)))
+	}
+
+	if delResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("delete failed with status %d", delResp.StatusCode)
+	}
+
+	p.log.Info("deleted TXT record", zap.String("name", name), zap.String("record_id", recordID))
 	return nil
 }

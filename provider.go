@@ -34,16 +34,6 @@ type Provider struct {
 	log *zap.Logger
 }
 
-// GetRecords lists DNS records in the zone. This is a no-op for our use case.
-func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
-	// Not implemented - return empty slice
-	// If you needed to implement this, you would:
-	// 1. Make API call to list records
-	// 2. Convert each record to libdns.RR
-	// 3. Return them wrapped as Records
-	return []libdns.Record{}, nil
-}
-
 // AppendRecords adds DNS records to the zone.
 func (p *Provider) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	if err := p.ensureAuthenticated(ctx); err != nil {
@@ -65,8 +55,16 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		}
 
 		appendedRecords = append(appendedRecords, record)
-		// It seems that the HTTP endpoint has a short delay before DNS records are actually active.
-		//
+	}
+
+	// The HTTP endpoint takes a short while before new records actually resolve.
+	if p.PropogationWaitTime > 0 {
+		p.log.Info("waiting for propagation", zap.Duration("wait", p.PropogationWaitTime))
+		select {
+		case <-time.After(p.PropogationWaitTime):
+		case <-ctx.Done():
+			return appendedRecords, ctx.Err()
+		}
 	}
 
 	return appendedRecords, nil
@@ -77,22 +75,33 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 	return p.AppendRecords(ctx, zone, records)
 }
 
-// DeleteRecords deletes DNS records from the zone. This is a no-op since we rely on auto-expiry.
+// DeleteRecords deletes DNS records from the zone.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	// Not implemented - rely on auto-expiry
-	// Return the records as if they were deleted
-	return records, nil
-}
+	if err := p.ensureAuthenticated(ctx); err != nil {
+		return nil, fmt.Errorf("authentication failed: %w", err)
+	}
 
-// GetZones lists all zones available. This is a no-op for our use case.
-func (p *Provider) GetZones(ctx context.Context) ([]libdns.Zone, error) {
-	// Not implemented - return empty slice
-	return []libdns.Zone{}, nil
+	var deleted []libdns.Record
+
+	for _, record := range records {
+		rr := record.RR()
+
+		if rr.Type != "TXT" {
+			return deleted, fmt.Errorf("only TXT records are supported, got %s", rr.Type)
+		}
+
+		if err := p.deleteTXTRecord(ctx, rr.Name, rr.Data); err != nil {
+			return deleted, fmt.Errorf("failed to delete record %s: %w", rr.Name, err)
+		}
+
+		deleted = append(deleted, record)
+	}
+
+	return deleted, nil
 }
 
 // Interface guards
 var (
-	_ libdns.RecordGetter   = (*Provider)(nil)
 	_ libdns.RecordAppender = (*Provider)(nil)
 	_ libdns.RecordSetter   = (*Provider)(nil)
 	_ libdns.RecordDeleter  = (*Provider)(nil)
